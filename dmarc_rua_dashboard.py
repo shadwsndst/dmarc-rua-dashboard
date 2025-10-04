@@ -5,7 +5,9 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from streamlit.components.v1 import html as st_html
 
-# --- Provider Map (expand over time) ---
+# ---------------------------
+# Provider Map (generic only)
+# ---------------------------
 PROVIDER_MAP = {
     "sendgrid": "SendGrid",
     "amazonses.com": "Amazon SES",
@@ -24,7 +26,9 @@ PROVIDER_MAP = {
     "yahoo.com": "Yahoo",
 }
 
-# -------------- Helpers --------------
+# ---------------------------
+# Helpers
+# ---------------------------
 def convert_unix_to_date(ts: str) -> str:
     try:
         return datetime.utcfromtimestamp(int(ts)).strftime("%Y-%m-%d %H:%M:%S")
@@ -32,178 +36,220 @@ def convert_unix_to_date(ts: str) -> str:
         return ""
 
 def format_date_short(date_str: str) -> str:
-    """Convert full timestamp string to YYYY-MM-DD if possible."""
     try:
         return datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S").strftime("%Y-%m-%d")
     except Exception:
         return date_str or ""
 
-def _collect_auth_domains(record, tag: str) -> list[str]:
-    """
-    From <auth_results>, collect zero or more <tag><domain> values.
-    tag is 'dkim' or 'spf'.
-    """
+def safe_txt(x) -> str:
+    return (x or "").strip()
+
+def lower_or_empty(x) -> str:
+    return safe_txt(x).lower()
+
+def domain_part(addr_or_domain: str) -> str:
+    s = lower_or_empty(addr_or_domain)
+    if "@" in s:
+        return s.split("@", 1)[-1]
+    return s
+
+# ---------------------------
+# XML parsing
+# ---------------------------
+def parse_dmarc_xml(path: str):
     out = []
     try:
-        for node in record.findall(f"auth_results/{tag}"):
-            dom = node.findtext("domain", default="")
-            if dom:
-                out.append(dom.strip())
+        root = ET.parse(path).getroot()
+
+        report_metadata = root.find("report_metadata")
+        org_name = safe_txt(report_metadata.findtext("org_name", default="")) if report_metadata is not None else ""
+        report_id = safe_txt(report_metadata.findtext("report_id", default="")) if report_metadata is not None else ""
+
+        date_range = report_metadata.find("date_range") if report_metadata is not None else None
+        begin = safe_txt(date_range.findtext("begin", default="")) if date_range is not None else ""
+        end   = safe_txt(date_range.findtext("end", default=""))   if date_range is not None else ""
+
+        policy_published = root.find("policy_published")
+        policy_domain = safe_txt(policy_published.findtext("domain", default="")) if policy_published is not None else ""
+
+        for rec in root.findall("record"):
+            r = rec.find("row")
+            source_ip = safe_txt(r.findtext("source_ip", default="")) if r is not None else ""
+            count     = int(safe_txt(r.findtext("count", default="0"))) if r is not None else 0
+            pe        = r.find("policy_evaluated") if r is not None else None
+            disposition = safe_txt(pe.findtext("disposition", default="")) if pe is not None else ""
+
+            identifiers = rec.find("identifiers")
+            header_from    = safe_txt(identifiers.findtext("header_from", default="")) if identifiers is not None else ""
+            envelope_from  = safe_txt(identifiers.findtext("envelope_from", default="")) if identifiers is not None else ""
+
+            ar = rec.find("auth_results")
+            dkim_domain = ""
+            spf_domain = ""
+            if ar is not None:
+                dkim_elem = ar.find("dkim")
+                if dkim_elem is not None:
+                    dkim_domain = safe_txt(dkim_elem.findtext("domain", default=""))
+                spf_elem = ar.find("spf")
+                if spf_elem is not None:
+                    spf_domain = safe_txt(spf_elem.findtext("domain", default=""))
+
+            out.append({
+                "reporting_domain": org_name,
+                "report_id": report_id,
+                "date_begin": begin,
+                "date_end": end,
+                "domain": policy_domain,
+                "source_ip": source_ip,
+                "count": count,
+                "disposition": disposition,
+                "header_from": header_from,
+                "envelope_from": envelope_from,
+                "auth_dkim_domain": dkim_domain,
+                "auth_spf_domain": spf_domain,
+                "xml_path": path,
+            })
     except Exception:
         pass
     return out
 
-def _pick_unknown_fingerprint(row) -> str:
-    """
-    When Provider == 'Unknown', choose the best string to display
-    so you can decide what to add to the map next time.
-    Preference: dkim_domains -> spf_domains -> header_from -> source_ip
-    """
-    for key in ("dkim_domains", "spf_domains", "header_from"):
-        val = str(row.get(key, "") or "").strip()
-        if val:
-            return val
-    return str(row.get("source_ip", "") or "unknown")
-
-def detect_provider(row) -> str:
-    """
-    Look for known fingerprints across header_from, DKIM/SPF domain strings,
-    and (optionally) the policy_published domain.
-    """
-    haystacks = [
-        str(row.get("header_from", "")).lower(),
-        str(row.get("dkim_domains", "")).lower(),
-        str(row.get("spf_domains", "")).lower(),
-        str(row.get("domain", "")).lower(),  # usually your protected domain
-    ]
-    for hay in haystacks:
-        for fingerprint, provider in PROVIDER_MAP.items():
-            if fingerprint in hay:
-                return provider
-    return "Unknown"
-
-def parse_dmarc_xml(path: str) -> list[dict]:
-    records = []
-    try:
-        tree = ET.parse(path)
-        root = tree.getroot()
-
-        report_metadata = root.find("report_metadata")
-        reporting_domain = report_metadata.findtext("org_name", default="") if report_metadata is not None else ""
-        report_id = report_metadata.findtext("report_id", default="") if report_metadata is not None else ""
-
-        date_range = report_metadata.find("date_range") if report_metadata is not None else None
-        begin = date_range.findtext("begin", default="") if date_range is not None else ""
-        end = date_range.findtext("end", default="") if date_range is not None else ""
-
-        policy_published = root.find("policy_published")
-        domain = policy_published.findtext("domain", default="") if policy_published is not None else ""
-
-        for record in root.findall("record"):
-            # Pass/fail flags from policy_evaluated (keep these)
-            disp = record.findtext("row/policy_evaluated/disposition", default="")
-            dkim_flag = record.findtext("row/policy_evaluated/dkim", default="")
-            spf_flag = record.findtext("row/policy_evaluated/spf", default="")
-
-            # Collect auth_results domains (this is what we needed for provider detection)
-            dkim_domains = sorted(set(_collect_auth_domains(record, "dkim")))
-            spf_domains = sorted(set(_collect_auth_domains(record, "spf")))
-
-            row = {
-                "reporting_domain": reporting_domain,
-                "report_id": report_id,
-                "date_begin": begin,
-                "date_end": end,
-                "domain": domain,  # protected domain in policy_published
-                "source_ip": record.findtext("row/source_ip", default=""),
-                "count": int(record.findtext("row/count", default="0")),
-                "disposition": disp,
-                "dkim": dkim_flag,  # pass/fail
-                "spf": spf_flag,    # pass/fail
-                "header_from": record.findtext("identifiers/header_from", default=""),
-                "dkim_domains": ";".join(dkim_domains),   # NEW
-                "spf_domains": ";".join(spf_domains),     # NEW
-                "xml_path": path,
-            }
-            records.append(row)
-    except Exception:
-        # swallow bad XML safely
-        pass
-    return records
-
-def parse_mbox_to_dataframe(mbox_file_or_bytes) -> pd.DataFrame:
-    data = (mbox_file_or_bytes.read() if hasattr(mbox_file_or_bytes, "read") else mbox_file_or_bytes)
+def parse_mbox_to_dataframe(mbox_file_or_bytes):
+    raw = mbox_file_or_bytes.read() if hasattr(mbox_file_or_bytes, "read") else mbox_file_or_bytes
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        tmp.write(data)
+        tmp.write(raw)
         mbox_path = tmp.name
 
     extract_dir = tempfile.mkdtemp()
     xml_files = []
 
     mbox = mailbox.mbox(mbox_path)
-    for i, message in enumerate(mbox):
-        if message.is_multipart():
-            for part in message.walk():
-                filename = part.get_filename()
-                if not filename:
-                    continue
-                payload = part.get_payload(decode=True)
-                fn = filename.lower()
-                if fn.endswith(".xml"):
-                    path = os.path.join(extract_dir, f"msg{i}_{filename}")
-                    with open(path, "wb") as f:
-                        f.write(payload)
-                    xml_files.append(path)
-                elif fn.endswith((".gz", ".gzip")):
-                    gz_path = os.path.join(extract_dir, f"msg{i}_{filename}")
-                    with open(gz_path, "wb") as f:
-                        f.write(payload)
-                    try:
-                        with gzip.open(gz_path, "rb") as gz:
-                            xml_content = gz.read()
-                        outpath = gz_path.rsplit(".", 1)[0]
-                        with open(outpath, "wb") as f:
-                            f.write(xml_content)
-                        xml_files.append(outpath)
-                    except Exception:
-                        pass
-                elif fn.endswith(".zip"):
-                    zip_path = os.path.join(extract_dir, f"msg{i}_{filename}")
-                    with open(zip_path, "wb") as f:
-                        f.write(payload)
-                    try:
-                        with zipfile.ZipFile(zip_path, "r") as z:
-                            z.extractall(extract_dir)
-                            for name in z.namelist():
-                                if name.lower().endswith(".xml"):
-                                    xml_files.append(os.path.join(extract_dir, name))
-                    except Exception:
-                        pass
+    for i, msg in enumerate(mbox):
+        if not msg.is_multipart():
+            continue
+        for part in msg.walk():
+            fname = part.get_filename()
+            if not fname:
+                continue
+            payload = part.get_payload(decode=True)
+            lf = fname.lower()
 
-    all_records = []
-    for f in xml_files:
-        all_records.extend(parse_dmarc_xml(f))
+            if lf.endswith(".xml"):
+                p = os.path.join(extract_dir, f"msg{i}_{fname}")
+                with open(p, "wb") as f:
+                    f.write(payload)
+                xml_files.append(p)
 
-    df = pd.DataFrame(all_records)
+            elif lf.endswith((".gz", ".gzip")):
+                gz_path = os.path.join(extract_dir, f"msg{i}_{fname}")
+                with open(gz_path, "wb") as f:
+                    f.write(payload)
+                try:
+                    with gzip.open(gz_path, "rb") as gz:
+                        xml_content = gz.read()
+                    outpath = gz_path.rsplit(".", 1)[0]
+                    with open(outpath, "wb") as f:
+                        f.write(xml_content)
+                    xml_files.append(outpath)
+                except Exception:
+                    pass
+
+            elif lf.endswith(".zip"):
+                zp = os.path.join(extract_dir, f"msg{i}_{fname}")
+                with open(zp, "wb") as f:
+                    f.write(payload)
+                try:
+                    with zipfile.ZipFile(zp, "r") as z:
+                        z.extractall(extract_dir)
+                        for name in z.namelist():
+                            if name.lower().endswith(".xml"):
+                                xml_files.append(os.path.join(extract_dir, name))
+                except Exception:
+                    pass
+
+    records = []
+    for p in xml_files:
+        records.extend(parse_dmarc_xml(p))
+
+    df = pd.DataFrame(records)
     if not df.empty:
         df["date_begin"] = df["date_begin"].apply(convert_unix_to_date)
-        df["date_end"] = df["date_end"].apply(convert_unix_to_date)
-        df["Provider"] = df.apply(detect_provider, axis=1)
-        df["Unknown_Fingerprint"] = df.apply(_pick_unknown_fingerprint, axis=1)
+        df["date_end"]   = df["date_end"].apply(convert_unix_to_date)
+        df["date_begin_dt"] = pd.to_datetime(df["date_begin"], errors="coerce", utc=True)
+        df["date_end_dt"]   = pd.to_datetime(df["date_end"], errors="coerce", utc=True)
     return df
 
+# ---------------------------
+# Provider inference
+# ---------------------------
+def detect_provider_and_domain(row):
+    candidates = [
+        row.get("auth_dkim_domain", ""),
+        row.get("auth_spf_domain", ""),
+        row.get("envelope_from", ""),
+        row.get("header_from", ""),
+    ]
+    cand_domains = [domain_part(c) for c in candidates if c]
+
+    for cd in cand_domains:
+        for key, name in PROVIDER_MAP.items():
+            if key in cd:
+                return name, cd
+
+    for cd in cand_domains:
+        if cd and cd != domain_part(row.get("domain", "")):
+            return None, cd
+
+    return None, domain_part(row.get("domain", ""))
+
+def compute_provider_tables(df_filtered: pd.DataFrame):
+    if df_filtered.empty:
+        return pd.DataFrame(columns=["provider","matched_domain","count"]), pd.DataFrame(columns=["domain","count"])
+
+    prov = df_filtered.apply(detect_provider_and_domain, axis=1, result_type="expand")
+    prov.columns = ["provider", "matched_domain"]
+    enriched = pd.concat([df_filtered.reset_index(drop=True), prov], axis=1)
+
+    failures = enriched[enriched["disposition"] != "none"].copy()
+
+    known = (
+        failures[failures["provider"].notna()]
+        .groupby(["provider", "matched_domain"], as_index=False)["count"]
+        .sum()
+        .sort_values("count", ascending=False)
+        .head(5)
+        .reset_index(drop=True)
+    )
+
+    own_domains = set(enriched["domain"].dropna().map(domain_part))
+    unknown = (
+        failures[(failures["provider"].isna()) & (~failures["matched_domain"].isin(own_domains))]
+        .groupby("matched_domain", as_index=False)["count"]
+        .sum()
+        .rename(columns={"matched_domain": "domain"})
+        .sort_values("count", ascending=False)
+        .head(5)
+        .reset_index(drop=True)
+    )
+
+    return known, unknown
+
+# ---------------------------
+# UI helpers
+# ---------------------------
 def stat_box(title, value, color="#ccc"):
     st.markdown(
         f"""
-        <div style="border:2px solid {color}; border-radius:10px; padding:15px; text-align:center; margin-bottom:10px;">
+        <div style="border:2px solid {color}; border-radius:10px; padding:16px; text-align:center; margin-bottom:10px;">
             <h4 style="margin:0;">{title}</h4>
-            <p style="font-size:24px; font-weight:bold; margin:5px 0; color:{color};">{value}</p>
+            <p style="font-size:24px; font-weight:bold; margin:6px 0; color:{color};">{value}</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-# -------------- APP --------------
+# ---------------------------
+# App
+# ---------------------------
 st.set_page_config(page_title="DMARC RUA Dashboard", layout="wide")
 st.title("DMARC RUA Dashboard")
 
@@ -215,140 +261,110 @@ if uploaded_file:
 
     if df_all.empty:
         st.warning("No DMARC XML records were found in the uploaded MBOX.")
-    else:
-        # --- Summary stats ---
-        total_reports = df_all["report_id"].nunique()
-        total_records = int(df_all["count"].sum())
-        date_min = df_all["date_begin"].min()
-        date_max = df_all["date_end"].max()
-        unique_ips = df_all["source_ip"].nunique()
+        st.stop()
 
-        passes = int(df_all[df_all["disposition"] == "none"]["count"].sum())
-        fails = int(df_all[df_all["disposition"] != "none"]["count"].sum())
-        total_msgs = passes + fails
-        pass_pct = round(passes / total_msgs * 100, 1) if total_msgs else 0.0
-        fail_pct = round(fails / total_msgs * 100, 1) if total_msgs else 0.0
+    # --- Date filter ---
+    st.subheader("Filter by Date Range")
+    default_start = pd.to_datetime(df_all["date_begin_dt"].min()).date()
+    default_end   = pd.to_datetime(df_all["date_end_dt"].max()).date()
 
-        # --- Failing-only view for certain tables ---
-        fails_df = df_all[df_all["disposition"] != "none"]
+    c1, c2 = st.columns([2,2])
+    with c1:
+        start_input = st.date_input("Start date", value=default_start)
+    with c2:
+        end_input   = st.date_input("End date",   value=default_end)
 
-        # Preserve: Top 5 Failing IPs with Domains
-        top_fail_ips = (
-            fails_df.groupby(["source_ip", "domain"])["count"]
-            .sum()
-            .sort_values(ascending=False)
-            .head(5)
-            .reset_index()
-        )
+    c3, c4 = st.columns([1,1])
+    with c3:
+        apply_filter = st.button("Apply Filter", use_container_width=True)
+    with c4:
+        clear_filter = st.button("Clear Filter", type="secondary", use_container_width=True)
 
-        # Preserve: Top 5 Reporting Domains (by volume)
-        top_reporting_domains = (
-            df_all.groupby(["reporting_domain"])["count"]
-            .sum()
-            .sort_values(ascending=False)
-            .head(5)
-            .reset_index()
-        )
+    if "active_range" not in st.session_state:
+        st.session_state.active_range = (default_start, default_end)
 
-        # New: Known vs Unknown Providers (by failures)
-        known_fail_df = fails_df[fails_df["Provider"] != "Unknown"]
-        unknown_fail_df = fails_df[fails_df["Provider"] == "Unknown"]
+    if apply_filter:
+        st.session_state.active_range = (start_input, end_input)
+    if clear_filter:
+        st.session_state.active_range = (default_start, default_end)
 
-        top_known_providers = (
-            known_fail_df.groupby(["Provider", "domain"])["count"]
-            .sum()
-            .sort_values(ascending=False)
-            .head(5)
-            .reset_index()
-        )
+    start_date, end_date = st.session_state.active_range
+    start_ts = pd.Timestamp(start_date).tz_localize("UTC")
+    end_ts   = pd.Timestamp(end_date).tz_localize("UTC")
 
-        top_unknown_fingerprints = (
-            unknown_fail_df.groupby(["Unknown_Fingerprint"])["count"]
-            .sum()
-            .sort_values(ascending=False)
-            .head(10)
-            .reset_index()
-            .rename(columns={"Unknown_Fingerprint": "fingerprint"})
-        )
+    df_filtered = df_all[(df_all["date_begin_dt"] >= start_ts) & (df_all["date_end_dt"] <= end_ts)].copy()
 
-        # --- Short dates for Slack ---
-        date_min_short = format_date_short(date_min)
-        date_max_short = format_date_short(date_max)
+    # --- Stats ---
+    total_reports = df_filtered["report_id"].nunique()
+    total_records = int(df_filtered["count"].sum()) if "count" in df_filtered else len(df_filtered)
+    unique_ips    = df_filtered["source_ip"].nunique()
 
-        # --- Slack message builder (restored & enhanced) ---
-        slack_message = (
-            f"*DMARC RUA Scorecard*\n"
-            f"_Date Range: {date_min_short} → {date_max_short}_\n\n"
-            f"📊 *Summary*\n"
-            f"Reports: *{total_reports}*\n"
-            f"Records: *{total_records}*\n"
-            f"Unique IPs: *{unique_ips}*\n"
-            f"Passed: *{passes}* ({pass_pct}%)\n"
-            f"Failed: *{fails}* ({fail_pct}%)\n\n"
-            f"🔥 *Top 5 Failing IPs (with Domains)*\n"
-            + "\n".join([f"{r.source_ip} ({r.domain}) → *{r['count']}*" for _, r in top_fail_ips.iterrows()]) + "\n\n"
-            f"🏢 *Top 5 Reporting Domains*\n"
-            + "\n".join([f"{r.reporting_domain} → *{r['count']}*" for _, r in top_reporting_domains.iterrows()]) + "\n\n"
-            f"🔧 *Top Known Providers (by Failures)*\n"
-            + ("\n".join([f"{r.Provider} ({r.domain}) → *{r['count']}*" for _, r in top_known_providers.iterrows()]) or "_(none detected)_") + "\n\n"
-            f"❓ *Unknown Provider Fingerprints (Needs Review)*\n"
-            + ("\n".join([f"{r.fingerprint} → *{r['count']}*" for _, r in top_unknown_fingerprints.iterrows()]) or "_(none)_")
-        )
+    passes = int(df_filtered[df_filtered["disposition"] == "none"]["count"].sum())
+    fails  = int(df_filtered[df_filtered["disposition"] != "none"]["count"].sum())
+    total_msgs = passes + fails
+    pass_pct = round(passes / total_msgs * 100, 1) if total_msgs else 0.0
+    fail_pct = round(fails / total_msgs * 100, 1) if total_msgs else 0.0
 
-        col1, col2 = st.columns([6, 1])
-        with col2:
-            st_html(
-                f"""
-                <div style="text-align:right;">
-                  <textarea id="slackText" style="position:absolute; left:-10000px; top:-10000px;">{slack_message}</textarea>
-                  <button id="copyBtn" style="padding:8px 10px; border-radius:8px; border:1px solid #ccc; cursor:pointer;">
-                    📋 Copy Slack Update
-                  </button>
-                </div>
-                <script>
-                const btn = document.getElementById('copyBtn');
-                const ta  = document.getElementById('slackText');
-                btn.addEventListener('click', async () => {{
-                  try {{
-                    await navigator.clipboard.writeText(ta.value);
-                    btn.textContent = '✅ Copied!';
-                    setTimeout(() => btn.textContent = '📋 Copy Slack Update', 1500);
-                  }} catch (e) {{
-                    ta.select(); ta.setSelectionRange(0, 999999);
-                    document.execCommand('copy');
-                    btn.textContent = '✅ Copied!';
-                    setTimeout(() => btn.textContent = '📋 Copy Slack Update', 1500);
-                  }}
-                }});
-                </script>
-                """,
-                height=60,
-            )
+    # --- Simple Slack message ---
+    start_short = start_date.isoformat()
+    end_short   = end_date.isoformat()
+    slack_message = (
+        f"*DMARC RUA Scorecard*\n"
+        f"_Date Range: {start_short} → {end_short}_\n\n"
+        f"📊 *Summary*\n"
+        f"Reports: *{total_reports}*\n"
+        f"Records: *{total_records}*\n"
+        f"Unique IPs: *{unique_ips}*\n"
+        f"Passed: *{passes}* ({pass_pct}%)\n"
+        f"Failed: *{fails}* ({fail_pct}%)\n"
+    )
+    st_html(
+        f"""
+        <div style="text-align:left; margin:8px 0 12px;">
+          <textarea id="slackText" style="position:absolute; left:-10000px; top:-10000px;">{slack_message}</textarea>
+          <button id="copyBtn" style="padding:8px 10px; border-radius:8px; border:1px solid #ccc; cursor:pointer;">
+            📋 Copy Slack Update
+          </button>
+        </div>
+        <script>
+        const btn = document.getElementById('copyBtn');
+        const ta  = document.getElementById('slackText');
+        btn.addEventListener('click', async () => {{
+          try {{
+            await navigator.clipboard.writeText(ta.value);
+            btn.textContent = '✅ Copied!';
+            setTimeout(() => btn.textContent = '📋 Copy Slack Update', 1500);
+          }} catch (e) {{
+            ta.select(); ta.setSelectionRange(0, 999999);
+            document.execCommand('copy');
+            btn.textContent = '✅ Copied!';
+            setTimeout(() => btn.textContent = '📋 Copy Slack Update', 1500);
+          }}
+        }});
+        </script>
+        """,
+        height=60,
+    )
 
-        # --- UI: Summary boxes (preserved) ---
-        st.subheader("Summary")
-        c1, c2, c3 = st.columns(3)
-        with c1: stat_box("Total Reports", total_reports, color="#007acc")
-        with c2: stat_box("Total Records", total_records, color="#007acc")
-        with c3: stat_box("Unique Sending IPs", unique_ips, color="#007acc")
+    # --- UI: Summary boxes ---
+    st.subheader("Summary")
+    a,b,c = st.columns(3)
+    with a: stat_box("Total Reports", total_reports, color="#007acc")
+    with b: stat_box("Total Records", total_records, color="#007acc")
+    with c: stat_box("Unique Sending IPs", unique_ips, color="#007acc")
 
-        c4, c5 = st.columns(2)
-        with c4: stat_box("Date Range Start", date_min_short, color="#888")
-        with c5: stat_box("Date Range End", date_max_short, color="#888")
+    d,e = st.columns(2)
+    with d: stat_box("Date Range Start", start_short, color="#888")
+    with e: stat_box("Date Range End",   end_short,   color="#888")
 
-        c6, c7 = st.columns(2)
-        with c6: stat_box("Messages Passed DMARC", f"{passes} ({pass_pct}%)", color="green")
-        with c7: stat_box("Messages Failed DMARC", f"{fails} ({fail_pct}%)", color="red")
+    f,g = st.columns(2)
+    with f: stat_box("Messages Passed DMARC", f"{passes} ({pass_pct}%)", color="green")
+    with g: stat_box("Messages Failed DMARC", f"{fails} ({fail_pct}%)",  color="red")
 
-        # --- Tables (preserved + new) ---
-        st.subheader("Top 5 Failing IPs with Domains")
-        st.dataframe(top_fail_ips, use_container_width=True)
+    # --- Tables ---
+    st.subheader("Top 5 Known Providers (by Failures)")
+    known_providers, unknown_domains = compute_provider_tables(df_filtered)
+    st.dataframe(known_providers.rename(columns={"matched_domain": "domain"}), use_container_width=True, hide_index=True)
 
-        st.subheader("Top 5 Reporting Domains")
-        st.dataframe(top_reporting_domains, use_container_width=True)
-
-        st.subheader("Top 5 Known Providers (by Failures)")
-        st.dataframe(top_known_providers, use_container_width=True)
-
-        st.subheader("Unknown Provider Fingerprints (Needs Review)")
-        st.dataframe(top_unknown_fingerprints, use_container_width=True)
+    st.subheader("Top 5 Unknown Domains (by Failures)")
+    st.dataframe(unknown_domains, use_container_width=True, hide_index=True)
