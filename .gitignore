@@ -8,5 +8,18 @@ __pycache__/
 # MacOS system files
 .DS_Store
 
-# VS Code settings (optional)
+# VS Code settings
 .vscode/
+
+# DMARC / Email data files (never commit raw data)
+*.mbox
+*.xml
+*.gz
+*.gzip
+*.zip
+*.json
+
+# Temp directories
+tmp/
+temp/
+*.tmp
