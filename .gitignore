@@ -4,6 +4,7 @@ __pycache__/
 
 # Virtual environment
 .venv/
+venv/
 
 # MacOS system files
 .DS_Store
@@ -19,7 +20,14 @@ __pycache__/
 *.zip
 *.json
 
-# Temp directories
+# Temp / logs
 tmp/
 temp/
 *.tmp
+*.log
+
+# Local secrets
+.env
+
+# Jupyter artifacts
+.ipynb_checkpoints/
