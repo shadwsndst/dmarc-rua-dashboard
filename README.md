@@ -48,7 +48,12 @@ Run the dashboard locally with:
 streamlit run dmarc_rua_dashboard.py
 ```
 
-Then open [http://localhost:8501](http://localhost:8501) in your browser.  
+### Alternate run method
+You can also use the included helper script to start the app with one command:
+```bash
+./run.sh
+```
+This will automatically activate your virtual environment, install dependencies if needed, and launch the Streamlit dashboard.
 
 ---
 

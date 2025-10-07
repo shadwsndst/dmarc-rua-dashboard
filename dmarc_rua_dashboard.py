@@ -4,6 +4,7 @@ import mailbox, gzip, zipfile, tempfile, os
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from streamlit.components.v1 import html as st_html
+from packaging import version
 
 # ---------------------------
 # Provider Map (generic only)
@@ -368,3 +369,52 @@ if uploaded_file:
 
     st.subheader("Top 5 Unknown Domains (by Failures)")
     st.dataframe(unknown_domains, use_container_width=True, hide_index=True)
+
+    # --- Visualization: Top 5 Reporting Domains by Week ---
+    import altair as alt
+
+    st.subheader("Top 5 Reporting Domains by Week")
+
+    if not df_filtered.empty:
+        df_filtered["week"] = df_filtered["date_begin_dt"].dt.to_period("W").apply(lambda r: r.start_time)
+        weekly_summary = (
+            df_filtered.groupby(["reporting_domain", "week"])["count"]
+            .sum()
+            .reset_index()
+        )
+
+        top5_domains = (
+            weekly_summary.groupby("reporting_domain")["count"]
+            .sum()
+            .nlargest(5)
+            .index
+        )
+
+        top5_df = weekly_summary[weekly_summary["reporting_domain"].isin(top5_domains)]
+
+        hover = alt.selection_single(fields=["reporting_domain"], nearest=True, on="mouseover", empty="none")
+
+        chart = (
+            alt.Chart(top5_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("week:T", title="Week"),
+                y=alt.Y("count:Q", title="Message Count"),
+                color=alt.Color("reporting_domain:N", title="Reporting Domain", scale=alt.Scale(scheme="tableau10")),
+                tooltip=[
+                    alt.Tooltip("reporting_domain:N", title="Domain"),
+                    alt.Tooltip("week:T", title="Week Start"),
+                    alt.Tooltip("count:Q", title="Count")
+                ],
+                opacity=alt.condition(hover, alt.value(1.0), alt.value(0.25))
+            )
+            .add_selection(hover)
+            .properties(height=400)
+        )
+
+        if version.parse(st.__version__) >= version.parse("1.50.0"):
+            st.altair_chart(chart, width='stretch')
+        else:
+            st.altair_chart(chart, use_container_width=True)
+    else:
+        st.info("No data available for weekly reporting domain trends.")
