@@ -20,6 +20,7 @@ The tool makes it easy to:
 - **Unknown Domain Detection** – quickly spot unrecognized senders for dictionary expansion  
 - **Date Range Filtering** – focus on specific time periods with start/end controls  
 - **Summary Stats** – reports, records, unique IPs, pass/fail percentages  
+- **Visual Graphs** – interactive weekly trend charts of top reporting domains, optimized for colorblind accessibility and hover text clarity  
 - **Top Lists** – failing IPs, reporting domains, *known providers*, *unknown domains*  
 
 ---
@@ -72,11 +73,6 @@ This will automatically activate your virtual environment, install dependencies 
 	•	Expand provider fingerprint dictionary.
 	•	Export reports to CSV/Excel.
 	•	Multi-file batch processing.
-
----
-
-## 🤝 Contributing  
-PRs welcome! If you’d like to add new provider fingerprints, please submit a pull request with dictionary updates.  
 
 ---
 
